@@ -1,4 +1,5 @@
 import sys
+import os
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PyQt6.QtGui import QIcon, QAction
 from PyQt6.QtCore import QTimer
@@ -6,33 +7,47 @@ from PyQt6.QtCore import QTimer
 from storage import Storage
 from note_window import NoteWindow
 
+
+def get_resource_path(filename):
+    """Get path to resource, works for dev and PyInstaller."""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, filename)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+
 class FloatNoteApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
-        self.app.setQuitOnLastWindowClosed(False) # Keep app running in tray
+        self.app.setQuitOnLastWindowClosed(False)
         
         self.storage = Storage()
-        self.windows = {} # Store references to keep windows alive
+        self.windows = {}
         
         self.setup_tray()
         self.load_existing_notes()
         
-        # If no notes exist, create one
         if not self.windows:
             self.create_new_note()
 
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self.app)
-        # We need an icon. For now, let's use a standard system icon or create a simple pixmap
-        # Since we don't have an image file, let's try to use a standard icon if possible, 
-        # or just run without a specific icon image (might be invisible on some systems).
-        # Better: Create a simple generated icon or use a standard one.
-        # PyQt6 doesn't have built-in standard icons easily accessible for tray without QStyle.
-        # Let's use a standard warning icon as a placeholder or just text if possible (Tray doesn't support text only).
-        # We will try to load a system icon.
-        style = self.app.style()
-        icon = style.standardIcon(style.StandardPixmap.SP_FileIcon)
+        
+        # Load custom icon
+        icon_path = get_resource_path("logo.ico")
+        if os.path.exists(icon_path):
+            icon = QIcon(icon_path)
+        else:
+            # Fallback to PNG
+            png_path = get_resource_path("logo.png")
+            if os.path.exists(png_path):
+                icon = QIcon(png_path)
+            else:
+                style = self.app.style()
+                icon = style.standardIcon(style.StandardPixmap.SP_FileIcon)
+        
         self.tray_icon.setIcon(icon)
+        self.app.setWindowIcon(icon)
+
         
         menu = QMenu()
         
