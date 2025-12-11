@@ -1,13 +1,10 @@
 import uuid
-import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QTextEdit, QPushButton, QFrame, QColorDialog, QMenu,
-                             QSizePolicy, QApplication, QFileDialog, QInputDialog,
-                             QSizeGrip, QLabel)
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QTimer, QSize, QUrl
-from PyQt6.QtGui import (QIcon, QAction, QFont, QTextCharFormat, QColor, QCursor,
-                         QTextListFormat, QTextCursor, QPixmap, QTextImageFormat,
-                         QImage, QDesktopServices, QPainter, QBrush, QPen)
+                             QTextEdit, QPushButton, QFrame, QMenu,
+                             QApplication, QInputDialog)
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtGui import (QAction, QFont, QTextCharFormat, QColor, QCursor,
+                         QTextListFormat, QKeyEvent, QPainter, QPen)
 
 from styles import Styles, Colors
 from storage import Storage
@@ -26,7 +23,6 @@ class ResizeGrip(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor(150, 150, 150), 1))
-        # Draw grip lines
         for i in range(3):
             x = self.width() - 4 - i * 4
             y = self.height() - 4 - i * 4
@@ -51,6 +47,22 @@ class ResizeGrip(QWidget):
         self.parent_window.schedule_save()
 
 
+class NoteEditor(QTextEdit):
+    """Custom editor that removes link formatting on Enter."""
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            cursor = self.textCursor()
+            fmt = cursor.charFormat()
+            if fmt.isAnchor():
+                fmt.setAnchor(False)
+                fmt.setAnchorHref("")
+                fmt.setForeground(QColor(Colors.TEXT_DARK))
+                fmt.setFontUnderline(False)
+                cursor.setCharFormat(fmt)
+                self.setTextCursor(cursor)
+        super().keyPressEvent(event)
+
+
 class NoteWindow(QMainWindow):
     closed = pyqtSignal(str)
     new_note = pyqtSignal()
@@ -60,7 +72,6 @@ class NoteWindow(QMainWindow):
         self.storage = Storage()
         self.drag_pos = None
         
-        # Initialize note data
         if note_data:
             self.note_id = note_data.get('id')
             self.content = note_data.get('content', '')
@@ -84,7 +95,12 @@ class NoteWindow(QMainWindow):
         # Auto-save timer
         self.save_timer = QTimer()
         self.save_timer.setSingleShot(True)
-        self.save_timer.timeout.connect(self.save_note)
+        self.save_timer.timeout.connect(self.auto_save)
+
+        # Style update timer
+        self.style_update_timer = QTimer()
+        self.style_update_timer.setSingleShot(True)
+        self.style_update_timer.timeout.connect(self.update_style_buttons)
 
     def setup_ui(self):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -102,30 +118,29 @@ class NoteWindow(QMainWindow):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
 
-        # Toolbar (Custom Title Bar)
+        # Toolbar
         self.toolbar = QFrame()
         self.toolbar.setFixedHeight(40)
         self.toolbar_layout = QHBoxLayout(self.toolbar)
         self.toolbar_layout.setContentsMargins(8, 0, 8, 0)
         self.toolbar_layout.setSpacing(2)
         
-        # Drag handle
         self.toolbar.mousePressEvent = self.toolbar_mouse_press
         self.toolbar.mouseMoveEvent = self.toolbar_mouse_move
         self.toolbar.mouseReleaseEvent = self.toolbar_mouse_release
 
-        # Toolbar Buttons - Row 1
+        # Buttons
         self.add_toolbar_button("+", self.new_note_requested, "New Note")
         self.add_separator()
-        self.add_toolbar_button("B", self.toggle_bold, "Bold")
-        self.add_toolbar_button("I", self.toggle_italic, "Italic")
-        self.add_toolbar_button("U", self.toggle_underline, "Underline")
+        
+        self.bold_btn = self.add_toolbar_button("B", self.toggle_bold, "Bold")
+        self.italic_btn = self.add_toolbar_button("I", self.toggle_italic, "Italic")
+        self.underline_btn = self.add_toolbar_button("U", self.toggle_underline, "Underline")
         self.add_separator()
-        self.add_toolbar_button("H", self.toggle_heading, "Heading")
-        self.add_toolbar_button("•", self.toggle_list, "Bullet List")
+        self.heading_btn = self.add_toolbar_button("H", self.toggle_heading, "Heading")
+        self.list_btn = self.add_toolbar_button("•", self.toggle_list, "Bullet List")
         self.add_separator()
         self.add_toolbar_button("🔗", self.insert_link, "Insert Link")
-        self.add_toolbar_button("🖼", self.insert_image, "Insert Image")
         self.add_separator()
         self.add_toolbar_button("🎨", self.change_color, "Change Color")
         
@@ -134,14 +149,18 @@ class NoteWindow(QMainWindow):
 
         self.toolbar_layout.addStretch()
         
+        # Clear button
+        self.add_toolbar_button("🗑", self.clear_note, "Clear")
+        
         self.add_toolbar_button("✕", self.close_note, "Close")
 
         self.layout.addWidget(self.toolbar)
 
         # Editor
-        self.editor = QTextEdit()
+        self.editor = NoteEditor()
         self.editor.setHtml(self.content)
         self.editor.textChanged.connect(self.on_text_changed)
+        self.editor.cursorPositionChanged.connect(self.schedule_style_update)
         self.editor.setAcceptRichText(True)
         self.layout.addWidget(self.editor)
 
@@ -191,7 +210,37 @@ class NoteWindow(QMainWindow):
             text_color=Colors.TEXT_DARK
         ) + Styles.SCROLLBAR)
 
-    # Window Dragging Logic
+    # Style updates
+    def schedule_style_update(self):
+        self.style_update_timer.start(50)
+
+    def update_style_buttons(self):
+        cursor = self.editor.textCursor()
+        fmt = cursor.charFormat()
+        
+        is_bold = fmt.fontWeight() == QFont.Weight.Bold
+        self._set_button_active(self.bold_btn, is_bold)
+        
+        is_italic = fmt.fontItalic()
+        self._set_button_active(self.italic_btn, is_italic)
+        
+        is_underline = fmt.fontUnderline()
+        self._set_button_active(self.underline_btn, is_underline)
+        
+        font_size = fmt.fontPointSize()
+        is_heading = font_size >= 18
+        self._set_button_active(self.heading_btn, is_heading)
+        
+        is_list = cursor.currentList() is not None
+        self._set_button_active(self.list_btn, is_list)
+
+    def _set_button_active(self, btn, active):
+        if active:
+            btn.setStyleSheet("background-color: rgba(0,0,0,0.25); border-radius: 4px; font-weight: bold;")
+        else:
+            btn.setStyleSheet("")
+
+    # Window Dragging
     def toolbar_mouse_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -218,6 +267,7 @@ class NoteWindow(QMainWindow):
         fmt.setFontWeight(new_weight)
         cursor.mergeCharFormat(fmt)
         self.editor.setTextCursor(cursor)
+        self.update_style_buttons()
 
     def toggle_italic(self):
         fmt = QTextCharFormat()
@@ -225,6 +275,7 @@ class NoteWindow(QMainWindow):
         fmt.setFontItalic(not cursor.charFormat().fontItalic())
         cursor.mergeCharFormat(fmt)
         self.editor.setTextCursor(cursor)
+        self.update_style_buttons()
 
     def toggle_underline(self):
         fmt = QTextCharFormat()
@@ -232,44 +283,43 @@ class NoteWindow(QMainWindow):
         fmt.setFontUnderline(not cursor.charFormat().fontUnderline())
         cursor.mergeCharFormat(fmt)
         self.editor.setTextCursor(cursor)
+        self.update_style_buttons()
 
     def toggle_heading(self):
         cursor = self.editor.textCursor()
         fmt = QTextCharFormat()
         current_size = cursor.charFormat().fontPointSize()
         if current_size == 0:
-            current_size = 14  # Default size
+            current_size = 14
         
         if current_size >= 18:
-            # Reset to normal
             fmt.setFontPointSize(14)
             fmt.setFontWeight(QFont.Weight.Normal)
         else:
-            # Make it a heading
             fmt.setFontPointSize(20)
             fmt.setFontWeight(QFont.Weight.Bold)
         
         cursor.mergeCharFormat(fmt)
         self.editor.setTextCursor(cursor)
+        self.update_style_buttons()
 
     def toggle_list(self):
         cursor = self.editor.textCursor()
         current_list = cursor.currentList()
         
         if current_list:
-            # Remove from list
             block_fmt = cursor.blockFormat()
             block_fmt.setIndent(0)
             cursor.setBlockFormat(block_fmt)
-            # Remove list
-            cursor.currentList().remove(cursor.block())
+            current_list.remove(cursor.block())
         else:
-            # Create bullet list
             list_fmt = QTextListFormat()
             list_fmt.setStyle(QTextListFormat.Style.ListDisc)
+            list_fmt.setIndent(1)
             cursor.createList(list_fmt)
         
         self.editor.setTextCursor(cursor)
+        self.update_style_buttons()
 
     def insert_link(self):
         cursor = self.editor.textCursor()
@@ -280,37 +330,13 @@ class NoteWindow(QMainWindow):
             if not selected_text:
                 selected_text = url
             
-            html = f'<a href="{url}">{selected_text}</a>'
-            cursor.insertHtml(html)
-            self.editor.setTextCursor(cursor)
-
-    def insert_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Image", "",
-            "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
-        )
-        if file_path:
-            cursor = self.editor.textCursor()
-            image = QImage(file_path)
+            fmt = QTextCharFormat()
+            fmt.setAnchor(True)
+            fmt.setAnchorHref(url)
+            fmt.setForeground(QColor("#0066cc"))
+            fmt.setFontUnderline(True)
             
-            # Scale if too large
-            max_width = self.editor.width() - 40
-            if image.width() > max_width:
-                image = image.scaledToWidth(max_width, Qt.TransformationMode.SmoothTransformation)
-            
-            # Add to document resources
-            doc = self.editor.document()
-            doc.addResource(
-                doc.ResourceType.ImageResource,
-                QUrl.fromLocalFile(file_path),
-                image
-            )
-            
-            img_fmt = QTextImageFormat()
-            img_fmt.setName(file_path)
-            img_fmt.setWidth(image.width())
-            img_fmt.setHeight(image.height())
-            cursor.insertImage(img_fmt)
+            cursor.insertText(selected_text, fmt)
             self.editor.setTextCursor(cursor)
 
     def change_color(self):
@@ -340,12 +366,10 @@ class NoteWindow(QMainWindow):
         
         for name, color in color_map.items():
             action = QAction(f"● {name}", self)
-            # Use default connection without lambda issue
             action.setData(color)
             action.triggered.connect(self.on_color_action_triggered)
             menu.addAction(action)
         
-        # Position menu below the button
         menu.exec(QCursor.pos())
 
     def on_color_action_triggered(self):
@@ -371,16 +395,26 @@ class NoteWindow(QMainWindow):
 
     def update_pin_style(self):
         if self.is_pinned:
-            self.pin_btn.setStyleSheet("background-color: rgba(0,0,0,0.2); border-radius: 4px;")
+            self.pin_btn.setStyleSheet("background-color: rgba(0,0,0,0.25); border-radius: 4px;")
         else:
             self.pin_btn.setStyleSheet("")
 
-    def close_note(self):
+    def clear_note(self):
+        """Clear content and delete from storage."""
+        self.editor.clear()
+        self.content = ""
         self.storage.delete_note(self.note_id)
+
+    def close_note(self):
         self.close()
         self.closed.emit(self.note_id)
 
     # Persistence
+    def has_content(self):
+        """Check if editor has real content (not just empty HTML)."""
+        plain_text = self.editor.toPlainText().strip()
+        return len(plain_text) > 0
+
     def on_text_changed(self):
         self.content = self.editor.toHtml()
         self.schedule_save()
@@ -389,7 +423,15 @@ class NoteWindow(QMainWindow):
         self.save_timer.stop()
         self.save_timer.start(500)
 
-    def save_note(self):
+    def auto_save(self):
+        """Auto-save only if there's content."""
+        if self.has_content():
+            self._do_save()
+        else:
+            # No content - remove from storage
+            self.storage.delete_note(self.note_id)
+
+    def _do_save(self):
         note_data = {
             'id': self.note_id,
             'content': self.content,
